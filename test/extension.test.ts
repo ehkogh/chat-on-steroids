@@ -169,8 +169,17 @@ class FakeNode {
     this.attrs.delete(name);
   }
 
+  /**
+   * Flat fakes register nodes under the exact selector the adapter asks with. Since the
+   * 2026-09 dual-renderer anchors, the adapter asks with a union of the classic and shell
+   * selectors; a union matches whatever its members match, in order, once each.
+   */
   querySelectorAll(selector: string): FakeNode[] {
-    return this.all.get(selector) ?? [];
+    const exact = this.all.get(selector);
+    if (exact) return exact;
+    const found: FakeNode[] = [];
+    for (const part of selector.split(/,\s*/)) for (const node of this.all.get(part) ?? []) if (!found.includes(node)) found.push(node);
+    return found;
   }
 
   querySelector(selector: string): FakeNode | null {
@@ -188,7 +197,7 @@ class FakeNode {
   }
 
   closest(selector: string): FakeNode | null {
-    return this.closestMatches.has(selector) ? this : null;
+    return selector.split(/,\s*/).some((part) => this.closestMatches.has(part)) ? this : null;
   }
 
   /** Flat fakes: a node only ever contains itself, which is all toolBlocks() asks. */
@@ -217,7 +226,7 @@ interface DomApi {
 
 function loadDom(sections: FakeNode[], pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'): DomApi {
   const document = {
-    querySelectorAll: (selector: string) => (selector === TURN_SELECTOR ? sections : []),
+    querySelectorAll: (selector: string) => (selector.split(/,\s*/).includes(TURN_SELECTOR) ? sections : []),
     querySelector: () => null
   };
   const context = vm.createContext({ document, location: { pathname } });

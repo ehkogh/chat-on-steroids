@@ -20,10 +20,41 @@
  * assistant request can also be split into several sections sharing data-turn-id, so
  * turns are grouped before messages, progress or tool blocks are counted. Hashed
  * CSS-module class names are never matched because they are intentionally ephemeral.
+ *
+ * Two renderers are live at once since 2026-09-18. ChatGPT A/B-tests its Codex app shell
+ * as the web UI: React root `#root`, sidebar `#app-shell-sidebar`, a composer form marked
+ * `data-chatgpt-composer`, and a thread of `[data-turn-key]` exchanges. That page has no
+ * `data-testid`, no `data-message-id`, no `.markdown` and no per-tool-call rows at all;
+ * its stable anchors are the `data-*` attributes named below. The classic page keeps its
+ * own anchors. The two never coexist in one document, so where a selector can name both
+ * shapes it does, and where the shapes differ in meaning — a shell turn is a whole
+ * user/assistant exchange — the reader branches on `shell()` and says so.
  */
 
 var CLF_DOM = (() => {
-  const TURN = 'section[data-testid^="conversation-turn"]';
+  const CLASSIC_TURN = 'section[data-testid^="conversation-turn"]';
+  /** One shell exchange: the user message, the response's activity and its final prose. */
+  const SHELL_TURN = '[data-turn-key]';
+  const TURN = `${CLASSIC_TURN}, ${SHELL_TURN}`;
+  /** A shell message slot, keyed `<turn id>:<index>:<role>`; the role is in the key. */
+  const SHELL_UNIT = '[data-content-search-unit-key]';
+  const SHELL_USER_UNIT = '[data-content-search-unit-key$=":user"]';
+  const SHELL_ASSISTANT_UNIT = '[data-content-search-unit-key$=":assistant"]';
+  /** The page's own marker where a shell response starts, before any prose exists. */
+  const SHELL_TURN_START = '[data-chatgpt-agent-turn-start]';
+  /** Shell markdown roots: the answer inside the assistant slot, commentary elsewhere. */
+  const SHELL_PROSE = '[data-markdown-text-style="assistant-message"]';
+  const SHELL_COMPOSER = 'form[data-chatgpt-composer]';
+  /** Authored assistant prose in either renderer, excluding shell commentary/thoughts. */
+  const PROSE = `.markdown, ${SHELL_ASSISTANT_UNIT} ${SHELL_PROSE}`;
+  /** Classic progress/reasoning containers; the shell has one activity block per response. */
+  const CLASSIC_PROGRESS = '[data-interrupted]';
+  /** Where a user message's identity and text live, in either renderer. */
+  const USER_HOLDER = `[data-message-author-role="user"], ${SHELL_USER_UNIT}`;
+  /** Whether this document is the Codex app shell rather than the classic page. */
+  function shell() {
+    return safe(() => !!document.querySelector(`${SHELL_COMPOSER}, #app-shell-sidebar, [data-app-shell-main-surface], ${SHELL_TURN}, #pending-home-input`), false);
+  }
   // ChatGPT has used both shapes in the live renderer: the older tool-message span
   // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
@@ -32,9 +63,12 @@ var CLF_DOM = (() => {
   // MAIN-world scan stamps only a row whose own message group proves api_tool.
   // A translated label or a generic built-in tool button never establishes identity.
   const CONNECTOR = '[data-clf-fiber]';
+  // The shell's composer Stop is labelled plainly "Stop"; the exact match keeps "Stop
+  // dictation" and any quoted control out, and nativeComposerControls scopes it to the form.
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
-    'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]';
+    'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], ' +
+    'button[aria-label="Stop"]';
   const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
   /** The composer's own trailing controls, where the send and dictation buttons live. */
   const TRAILING =
@@ -69,12 +103,13 @@ var CLF_DOM = (() => {
   }
   function presentUserPrompts(readUserText) {
     return safe(() => {
-      for (const raw of document.querySelectorAll('[data-message-author-role="user"] :is(.whitespace-pre-wrap, .markdown):not([data-clf-user-text])')) {
+      for (const raw of document.querySelectorAll(`[data-message-author-role="user"] :is(.whitespace-pre-wrap, .markdown):not([data-clf-user-text]), ${SHELL_USER_UNIT} .whitespace-pre-wrap:not([data-clf-user-text])`)) {
         // Both native renderers can consume Markdown bytes. Parse the same
         // exact-id source used by receipts/recording, never reconstructed HTML.
-        const holder = raw.closest('[data-message-author-role="user"]');
-        const source = readUserText ? readUserText({ role: 'user', id: holder?.getAttribute('data-message-id'),
-          node: raw.closest(TURN), text: messageText(holder, 'user') }) : raw.textContent;
+        const holder = raw.closest(USER_HOLDER);
+        const section = raw.closest(TURN);
+        const source = readUserText ? readUserText({ role: 'user', id: messageIdOf(holder), turnId: turnIdOf(section),
+          node: section, text: messageText(holder, 'user') }) : raw.textContent;
         // The native editor can prepend a blank paragraph to the exact provider
         // source. Ignore that outer whitespace only for display; the frame's
         // internal length/boundary and all receipt/recording bytes stay exact.
@@ -117,6 +152,22 @@ var CLF_DOM = (() => {
   function stripOwn(clone) {
     if (!clone || typeof clone.querySelectorAll !== 'function') return clone;
     for (const own of clone.querySelectorAll(OWN_SURFACES)) own.remove();
+    return stripShellChrome(clone);
+  }
+
+  /**
+   * Removes the shell's activity disclosure header ("Worked for 12s") from a clone.
+   *
+   * That header is a stopwatch: its text changes every second while a response runs, and
+   * it sits inside the same block as the commentary. Left in, every tick reads as revised
+   * commentary and is recorded again. It is the one disclosure control in that block that
+   * carries no authored prose, which is how it is told apart from a caption row.
+   */
+  function stripShellChrome(clone) {
+    if (!shell() || !clone || typeof clone.querySelectorAll !== 'function') return clone;
+    for (const button of clone.querySelectorAll('button[aria-expanded]')) {
+      if (!button.querySelector(SHELL_PROSE)) button.remove();
+    }
     return clone;
   }
 
@@ -193,9 +244,15 @@ var CLF_DOM = (() => {
         if (parts.length > 0) return parts.join('\n');
       }
       if (role === 'assistant') {
-        const parts = [...node.querySelectorAll('.markdown')]
-          .filter((part) => !(part.closest && part.closest('[data-interrupted]')))
+        // Outermost prose roots only, as for user blocks above: the shell can nest a
+        // markdown root inside another, and reading both records the passage twice.
+        const parts = [...node.querySelectorAll(PROSE)]
+          .filter((part) => !(part.closest && part.closest(CLASSIC_PROGRESS)))
           .filter((part) => !(part.closest && part.closest(TOOL)))
+          .filter((part) => {
+            const outer = part.parentElement && part.parentElement.closest && part.parentElement.closest(PROSE);
+            return !outer || outer === node || !(node.contains && node.contains(outer));
+          })
           .map((part) => text(part))
           .filter(Boolean);
         if (parts.length > 0) return parts.join('\n\n');
@@ -231,7 +288,10 @@ var CLF_DOM = (() => {
       // reader takes as "what it said", so absence beats a plausible-looking invention.
       if (role === 'assistant') {
         for (const row of clone.querySelectorAll(TOOL)) row.remove();
-        for (const commentary of clone.querySelectorAll('[data-interrupted]')) commentary.remove();
+        for (const commentary of clone.querySelectorAll(CLASSIC_PROGRESS)) commentary.remove();
+        // A shell response container also holds the user's own message and the activity
+        // block; neither is what the assistant said.
+        for (const other of [...clone.querySelectorAll(SHELL_USER_UNIT), ...shellActivityBlocks(clone)]) other.remove();
       }
       return text(clone);
     }, '');
@@ -272,7 +332,7 @@ var CLF_DOM = (() => {
         for (const row of clone.querySelectorAll(TOOL)) row.remove();
         authored = text(clone);
       } else {
-        authored = [...node.querySelectorAll('.markdown')]
+        authored = [...node.querySelectorAll(PROSE)]
           .filter((part) => !(part.closest && (part.closest(TOOL) || part.closest(OWN_SURFACES))))
           .map((part) => text(part))
           .join('\n');
@@ -387,7 +447,11 @@ var CLF_DOM = (() => {
     'data-turn',
     'data-turn-id',
     'data-testid',
-    'aria-label'
+    'aria-label',
+    'data-turn-key',
+    'data-content-search-turn-key',
+    'data-content-search-unit-key',
+    'data-markdown-text-style'
   ];
 
   function invalidateFrom(record) {
@@ -396,6 +460,10 @@ var CLF_DOM = (() => {
     const element = target.nodeType === 1 ? target : target.parentElement;
     const section = element && typeof element.closest === 'function' ? element.closest(TURN) : null;
     if (section) sectionCache.delete(section);
+    // A shell user slot is read as its own section; the page renames its key when a fresh
+    // chat is given its turn id, and the memo taken under the placeholder key must go.
+    const slot = element && typeof element.closest === 'function' ? element.closest(SHELL_UNIT) : null;
+    if (slot) sectionCache.delete(slot);
   }
 
   function ensureCacheObserver() {
@@ -433,15 +501,35 @@ var CLF_DOM = (() => {
     return memo;
   }
 
+  /**
+   * The message identity a renderer puts on a message holder, or null.
+   *
+   * Classic: ChatGPT's own message UUID. Shell: the slot key `<turn id>:<index>:<role>`,
+   * which is unique in the document and survives repaints; the provider's message UUID for
+   * that slot is only in React and reaches the recorder through the Fiber scan instead.
+   */
+  function messageIdOf(node) {
+    return safe(() => node && node.getAttribute ? node.getAttribute('data-message-id') || node.getAttribute('data-content-search-unit-key') || null : null, null);
+  }
+
+  /** The role a shell slot key names, or '' for a key of another shape. */
+  function shellUnitRole(node) {
+    const key = node && node.getAttribute ? node.getAttribute('data-content-search-unit-key') || '' : '';
+    const role = key.slice(key.lastIndexOf(':') + 1);
+    return role === 'user' || role === 'assistant' ? role : '';
+  }
+
   /** The explicit messages of one section: id, the role attribute, text. */
   function sectionRows(section) {
     const memo = memoOf(section);
     if (memo && memo.rows) return memo.rows;
     const rows = [];
-    for (const node of section.querySelectorAll('[data-message-id]')) {
-      const id = node.getAttribute('data-message-id');
+    // A shell user turn is its own message slot rather than a section around one.
+    const holders = [...(section.matches && section.matches(SHELL_UNIT) ? [section] : []), ...section.querySelectorAll(`[data-message-id], ${SHELL_UNIT}`)];
+    for (const node of holders) {
+      const id = messageIdOf(node);
       if (!id) continue;
-      const roleAttr = node.getAttribute('data-message-author-role') || '';
+      const roleAttr = node.getAttribute('data-message-author-role') || shellUnitRole(node);
       const readable = roleAttr === 'user' || roleAttr === 'assistant';
       rows.push({ id, roleAttr, text: readable ? messageText(node, roleAttr) : null, node });
     }
@@ -454,8 +542,8 @@ var CLF_DOM = (() => {
     const memo = memoOf(section);
     if (memo && memo.parts) return memo.parts;
     const parts = [];
-    for (const markdown of section.querySelectorAll('.markdown')) {
-      if (markdown.closest && markdown.closest('[data-interrupted]')) continue;
+    for (const markdown of section.querySelectorAll(PROSE)) {
+      if (markdown.closest && markdown.closest(CLASSIC_PROGRESS)) continue;
       if (markdown.closest && markdown.closest(TOOL)) continue;
       if (markdown.closest && markdown.closest(OWN_SURFACES)) continue;
       const value = text(markdown);
@@ -465,8 +553,41 @@ var CLF_DOM = (() => {
     return parts;
   }
 
+  /** The page turn id of a section, in either renderer; null where the page names none. */
+  function turnIdOf(section) {
+    return safe(() => {
+      if (!section || !section.getAttribute) return null;
+      if (section.matches(SHELL_TURN)) {
+        const keyed = section.querySelector('[data-content-search-turn-key]');
+        return (keyed && keyed.getAttribute('data-content-search-turn-key')) || section.getAttribute('data-turn-key') || null;
+      }
+      return section.getAttribute('data-turn-id');
+    }, null);
+  }
+
+  /**
+   * The shell's exchanges as the two logical turns the rest of this file expects.
+   *
+   * One `[data-turn-key]` holds the user's message and the whole response. The user turn
+   * is that message's own slot. The assistant turn is the exchange container, because the
+   * response is not one node: its activity block and its answer slot are siblings, and a
+   * response that has not produced a token yet is only the page's turn-start marker. Every
+   * reader of an assistant section therefore has to leave the user slot alone, and does.
+   */
+  function shellTurns() {
+    const out = [];
+    for (const node of document.querySelectorAll(SHELL_TURN)) {
+      const id = turnIdOf(node);
+      const user = [...node.querySelectorAll(SHELL_USER_UNIT)].find((unit) => unit.closest(SHELL_TURN) === node);
+      if (user) out.push({ node: user, nodes: [user], id, role: 'user' });
+      if (node.querySelector(`${SHELL_TURN_START}, ${SHELL_ASSISTANT_UNIT}`)) out.push({ node, nodes: [node], id, role: 'assistant' });
+    }
+    return out;
+  }
+
   function turns() {
     return safe(() => {
+      if (shell()) return shellTurns();
       const out = [];
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
@@ -547,6 +668,9 @@ var CLF_DOM = (() => {
           if (seen.has(row.id)) continue;
           const role = row.roleAttr || turn.role;
           if (role !== 'user' && role !== 'assistant') continue;
+          // A shell assistant section is the whole exchange; the user's slot inside it is
+          // the user turn's message, not this one's.
+          if (turn.role && role !== turn.role) continue;
           seen.add(row.id);
           explicit++;
           out.push({
@@ -762,10 +886,28 @@ var CLF_DOM = (() => {
     return found;
   }
 
+  /**
+   * The shell's activity blocks of one response: commentary, thought captions and the
+   * "Worked for" disclosure. It is the sibling block carrying the page's own turn-start
+   * marker. A block that also held the answer slot or the user's message would be the
+   * whole exchange rather than its activity, so that shape is refused rather than hidden.
+   */
+  function shellActivityBlocks(section) {
+    const out = [];
+    for (const start of section.querySelectorAll(SHELL_TURN_START)) {
+      const block = start.parentElement;
+      if (!block || block === section || block.closest(OWN_SURFACES)) continue;
+      if (block.querySelector(`${SHELL_ASSISTANT_UNIT}, ${SHELL_USER_UNIT}`)) continue;
+      out.push(block);
+    }
+    return out;
+  }
+
   function progressRoots(section) {
-    return [...section.querySelectorAll('[data-interrupted]')].filter(
-      (node) => !(node.parentElement && node.parentElement.closest && node.parentElement.closest('[data-interrupted]'))
+    const classic = [...section.querySelectorAll(CLASSIC_PROGRESS)].filter(
+      (node) => !(node.parentElement && node.parentElement.closest && node.parentElement.closest(CLASSIC_PROGRESS))
     );
+    return classic.length > 0 ? classic : shellActivityBlocks(section);
   }
 
   /**
@@ -1011,7 +1153,7 @@ var CLF_DOM = (() => {
     return safe(() => {
       let marked = 0;
       for (const section of turnNodes(turn)) {
-        for (const box of section.querySelectorAll('[data-interrupted]')) {
+        for (const box of [...section.querySelectorAll(CLASSIC_PROGRESS), ...shellActivityBlocks(section)]) {
           if (!box.hasAttribute('data-clf-progress')) marked++;
           box.setAttribute('data-clf-progress', '1');
         }
@@ -1077,6 +1219,13 @@ var CLF_DOM = (() => {
         turnNodes(turn).flatMap((section) => {
           const memo = memoOf(section);
           if (memo && memo.blocks) return memo.blocks;
+          // The shell draws no per-call row: its activity block summarises a run of calls
+          // under one thought caption, and a display-contents wrapper there is layout,
+          // never a call. Nothing to relabel; the chronology comes from the page model.
+          if (section.matches && section.matches(SHELL_TURN)) {
+            if (memo) memo.blocks = [];
+            return [];
+          }
           const current = [...section.querySelectorAll(TOOL)];
           const found = (current.length > 0 ? current : [...section.querySelectorAll(TOOL_LEGACY)]).filter(
             isToolBlock
@@ -1117,14 +1266,7 @@ var CLF_DOM = (() => {
       const out = [];
       let markerBase = 0;
       for (const section of turnNodes(turn)) {
-        const roots = [...section.querySelectorAll('[data-interrupted]')].filter((node) => {
-          const parent = node.parentElement && node.parentElement.closest
-            ? node.parentElement.closest('[data-interrupted]')
-            : null;
-          return !parent;
-        });
-
-        for (const root of roots) {
+        for (const root of progressRoots(section)) {
           // ChatGPT's reasoning is one outer data-interrupted container. Its inner
           // display-contents activity rows are the *actual chronology slots*; plain text
           // between them is the visible commentary. Replacing those rows with sentinels in
@@ -1132,7 +1274,8 @@ var CLF_DOM = (() => {
           // Strip our own stream before reading a single character of this subtree. Without
           // it, every repaint reads back what we rendered last time and republishes it.
           const clone = stripOwn(root.cloneNode(true));
-          const found = [...clone.querySelectorAll(TOOL)].filter(isToolBlock);
+          // Shell activity has captions and commentary but no call slots (see toolBlocks).
+          const found = section.matches && section.matches(SHELL_TURN) ? [] : [...clone.querySelectorAll(TOOL)].filter(isToolBlock);
           const slots = collapseNested(found, true);
           if (slots.length === 0) {
             const value = (clone.innerText || clone.textContent || '').trim();
@@ -1379,7 +1522,7 @@ var CLF_DOM = (() => {
             out.push({ text: 'Thinking failed', node: button, turnId: turn.id, turn,
               reason: 'thinking_failed', recoverable: false });
           }
-          for (const markdown of section.querySelectorAll('.markdown')) {
+          for (const markdown of section.querySelectorAll(PROSE)) {
             const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
             if (!value || !transportFailure(value) || texts.has(value)) continue;
             texts.add(value);
@@ -1391,8 +1534,14 @@ var CLF_DOM = (() => {
     }, []);
   }
 
+  /**
+   * The native editor. Classic keeps its id; the shell's editor has none, so it is the
+   * editable textbox of the marked composer form. Before the shell hydrates, the page shows
+   * a plain `textarea#pending-home-input` that buffers typing for the real editor — it is
+   * not contenteditable, so it never matches, and a page that has only that is not ready.
+   */
   function composer() {
-    return safe(() => document.querySelector('#prompt-textarea'), null);
+    return safe(() => document.querySelector(`#prompt-textarea, ${SHELL_COMPOSER} [contenteditable="true"][role="textbox"]`), null);
   }
 
   /**
@@ -1513,8 +1662,8 @@ var CLF_DOM = (() => {
     return safe(() => {
       for (const turn of turns()) {
         for (const section of turnNodes(turn)) {
-          for (const node of section.querySelectorAll('[data-message-id]')) {
-            const role = node.getAttribute('data-message-author-role') || turn.role;
+          for (const node of section.querySelectorAll(`[data-message-id], ${SHELL_UNIT}`)) {
+            const role = node.getAttribute('data-message-author-role') || shellUnitRole(node) || turn.role;
             if (role === 'assistant') return null;
             if (role === 'user') return node;
           }
@@ -1787,6 +1936,14 @@ var CLF_DOM = (() => {
         } else {
           const first = sections[0];
           if (!first.parentElement) return false;
+          // A shell section is the whole exchange, and the response begins at the page's
+          // own turn-start marker inside it; above the section would be above the user's
+          // message. Keep the stream right after that marker.
+          const start = first.matches(SHELL_TURN) ? shellActivityBlocks(first).map((block) => block.querySelector(SHELL_TURN_START))[0] : null;
+          if (start) {
+            if (root.previousSibling !== start) start.after(root);
+            return true;
+          }
           // A tool-only response has no authored separator. Keep the existing
           // response sibling stable through React's temporary host moves.
           if (!root.isConnected || sections.includes(root.parentElement)) first.parentElement.insertBefore(root, first);
@@ -1835,11 +1992,24 @@ var CLF_DOM = (() => {
       // paragraph: an extra block wrapper is not part of the authored prompt.
       // Text nodes keep markup literal; there is no paste fallback.
       const paragraph = document.createElement('p');
+      // The shell's editor is a markdown editor: text it holds as ordinary text nodes is
+      // escaped when the message is serialised — `\#`, `\-`, a backslash before every
+      // line break — so the model would receive different bytes from the ones authored and
+      // the app's prompt frame would no longer parse. Its schema keeps a `literalPaste`
+      // mark for pasted text, parsed from `span[data-prompt-literal-paste]` and serialised
+      // verbatim with plain newlines (measured in the live bundle, 2026-09-19). Insert
+      // through that mark. The classic editor has no such mark and keeps the text of an
+      // unknown span, so the wrapper is only added where it means something.
+      const host = shell() ? document.createElement('span') : paragraph;
+      if (host !== paragraph) {
+        host.setAttribute('data-prompt-literal-paste', '');
+        paragraph.append(host);
+      }
       value.split('\n').forEach((line, index) => {
-        if (index) paragraph.append(document.createElement('br'));
-        paragraph.append(document.createTextNode(line));
+        if (index) host.append(document.createElement('br'));
+        host.append(document.createTextNode(line));
       });
-      if (value === '') paragraph.append(document.createElement('br'));
+      if (value === '') host.append(document.createElement('br'));
       if (!document.execCommand('insertHTML', false, paragraph.innerHTML)) return reject('native_edit_rejected');
       const compact = text => String(text || '').replace(/\s+/g, '');
       const expected = mode === 'append' ? existing + value : value;
@@ -2000,8 +2170,14 @@ var CLF_DOM = (() => {
       const actions = [...group.querySelectorAll('button')].filter(node => !node.closest('[data-default-action="true"]'));
       return actions.length === 1 && actions[0] === button ? group.getAttribute('aria-label') : undefined;
     }
-    return /^Remove file(?: \d+)?: (.+)$/.exec(button.getAttribute('aria-label') || '')?.[1];
+    const label = button.getAttribute('aria-label') || '';
+    // The shell's tile control is "Remove <name>", only ever inside its attachment strip.
+    if (button.closest('[data-composer-attachments]')) return /^Remove (.+)$/.exec(label)?.[1];
+    return /^Remove file(?: \d+)?: (.+)$/.exec(label)?.[1];
   }
+  /** The native file inputs. Classic names them by id; the shell's have random ids and are told apart by `accept`. */
+  const PHOTO_INPUT = `input#upload-photos[type="file"][accept="image/*"], ${SHELL_COMPOSER} input[type="file"][accept="image/*"]`;
+  const FILE_INPUT = `input#upload-files[type="file"], ${SHELL_COMPOSER} input[type="file"]:not([accept]), ${SHELL_COMPOSER} input[type="file"][accept=""]`;
   function hasComposerAttachments() {
     const host = composerBox() || composerActions()?.host;
     return !!host && (!!host.querySelector('[data-inline-file-uploading], [role="progressbar"]') ||
@@ -2053,7 +2229,7 @@ var CLF_DOM = (() => {
     if (files.length) images = [...(images || []), ...files];
     if (!images?.length) return true;
     if (!Array.isArray(images) || images.length > 20 || !stillCurrent() || hasComposerAttachments()) return false;
-    const input = document.querySelector(files.length ? 'input#upload-files[type="file"]' : 'input#upload-photos[type="file"][accept="image/*"]');
+    const input = document.querySelector(files.length ? FILE_INPUT : PHOTO_INPUT);
     if (!input) return false;
     const priorTiles = new Set((composerBox() || composerActions()?.host)?.querySelectorAll('button[aria-label]') || []);
     const transfer = new DataTransfer();
@@ -2153,9 +2329,13 @@ var CLF_DOM = (() => {
     }
     return false;
   }
+  /** The open native picker's content: classic by test id, the shell's by its view marker. */
+  const PICKER = '[data-testid="composer-intelligence-picker-content"], [data-model-picker-view]';
+  /** The control that swaps the picker between its effort slider and its version list. */
+  const PICKER_VERSION_TOGGLE = '[role="menuitem"][aria-expanded], [role="menuitem"][data-model-picker-view-toggle]';
   function modelPickerAccess(stillCurrent) {
     const shown = node => node && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
-    const picker = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+    const picker = () => document.querySelector(PICKER);
     const trigger = modelPickerTrigger;
     let motion = null;
     const openPicker = () => {
@@ -2189,7 +2369,7 @@ var CLF_DOM = (() => {
         // focus scope indefinitely. Suppress only this owned picker animation for
         // this operation; native state still closes/unmounts it and proves release.
         motion = document.createElement('style');
-        motion.textContent = '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]){animation:none!important}';
+        motion.textContent = '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]),[role="menu"]:has([data-model-picker-view]){animation:none!important}';
         document.head.append(motion);
         // A cold home editor mounts before its native Chat/Work picker. Workers
         // enter here directly, without the New Chat reuse/catalog preparation.
@@ -2222,7 +2402,7 @@ var CLF_DOM = (() => {
         // The picker may already show the version list (including a checked row).
         // Select that row to return to its effort view; never assume the slider is open.
         if (!versionRows().length) {
-          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded]')].filter(shown);
+          const toggle = [...picker().querySelectorAll(PICKER_VERSION_TOGGLE)].filter(shown);
           if (toggle.length !== 1) return null;
           toggle[0].click();
         }
@@ -2252,7 +2432,7 @@ var CLF_DOM = (() => {
   // The current native picker or closed trigger carries the MAIN-world snapshot.
   // The route stamp prevents a retained composer from lending another chat proof.
   function visibleModelSelection() {
-    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]') || modelPickerTrigger();
+    const node = document.querySelector(PICKER) || modelPickerTrigger();
     if (node?.getAttribute('data-clf-selected-route') !== location.pathname) return null;
     const model = node?.getAttribute('data-clf-selected-model'), reasoningEffort = node?.getAttribute('data-clf-selected-effort');
     return model && /^[a-zA-Z0-9._-]{1,80}$/.test(model) && ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(reasoningEffort)
@@ -2261,26 +2441,37 @@ var CLF_DOM = (() => {
   /** Account model discovery belongs to Chat; Work mounts a different picker.
    * The caller owns one idle document and verifies draft/epoch before and after this transition. */
   async function prepareChatModelSurface(stillCurrent = () => true) {
-    const radios = () => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')]
-      .filter(node => !node.closest(OWN_SURFACES) && node.getClientRects().length > 0);
+    const visible = node => !node.closest(OWN_SURFACES) && node.getClientRects().length > 0;
+    const radios = () => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')].filter(visible);
+    // The shell's home header carries one two-way "Composer mode" pressed-button group,
+    // Chat first and Work second, with no value attribute to name either. Its label and
+    // captions are translated, so the group is recognised by shape: exactly two pressed
+    // buttons in a group inside the app-shell title bar, and nothing else in that bar.
+    const shellToggle = () => {
+      const groups = [...document.querySelectorAll('[data-app-shell-titlebar] [role="group"]')]
+        .map(group => [...group.querySelectorAll('button[aria-pressed]')].filter(visible))
+        .filter(buttons => buttons.length === 2);
+      return groups.length === 1 ? { chat: groups[0][0], work: groups[0][1] } : null;
+    };
+    const pressed = node => node.getAttribute('aria-checked') || node.getAttribute('aria-pressed');
     const state = () => {
       const nodes = radios(), chat = nodes.filter(node => node.getAttribute('data-tpp-toggle-value') === 'chatgpt'),
         work = nodes.filter(node => node.getAttribute('data-tpp-toggle-value') === 'work');
-      return chat.length === 1 && work.length === 1 ? { chat: chat[0], work: work[0] } : null;
+      return chat.length === 1 && work.length === 1 ? { chat: chat[0], work: work[0] } : shellToggle();
     };
     if (!stillCurrent()) return false;
     const before = state();
     // Existing ordinary conversations do not expose the new-chat surface toggle.
     if (!before) return radios().length === 0;
-    if (before.chat.getAttribute('aria-checked') === 'true') return true;
-    if (before.work.getAttribute('aria-checked') !== 'true' || before.chat.disabled || before.chat.getAttribute('aria-disabled') === 'true') return false;
+    if (pressed(before.chat) === 'true') return true;
+    if (pressed(before.work) !== 'true' || before.chat.disabled || before.chat.getAttribute('aria-disabled') === 'true') return false;
     return new Promise(resolve => {
       let done = false;
       const finish = value => { if (done) return; done = true; observer.disconnect(); clearTimeout(timer); resolve(value); };
       const check = () => {
         if (!stillCurrent()) return finish(false);
         const next = state();
-        if (next?.chat.getAttribute('aria-checked') === 'true' && next.work.getAttribute('aria-checked') === 'false') finish(true);
+        if (next && pressed(next.chat) === 'true' && pressed(next.work) === 'false') finish(true);
       };
       const observer = new MutationObserver(check);
       observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
@@ -2407,12 +2598,15 @@ var CLF_DOM = (() => {
 
   async function newChatControl(stillCurrent = () => true) {
     const shown = node => node && !node.closest(OWN_SURFACES) && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
-    const link = (root = document) => [...root.querySelectorAll('a[data-testid="create-new-chat-button"][data-sidebar-item="true"][href="/"]')].find(shown) || null;
+    // The shell's sidebar has no links: New chat is a button whose only stable name is its
+    // accessible label. That label is translated, so a page in another language reports no
+    // control and the caller opens a fresh document instead — a slower path, not a wrong one.
+    const link = (root = document) => [...root.querySelectorAll('a[data-testid="create-new-chat-button"][data-sidebar-item="true"][href="/"], #app-shell-sidebar button[aria-label="New chat" i]')].find(shown) || null;
     if (!stillCurrent()) return null;
     if (link()) return link();
     // Compact ChatGPT unmounts navigation when its sidebar is closed. Reveal the
     // actual native control before concluding that this document cannot be reused.
-    const toggles = [...document.querySelectorAll('button[data-testid="open-sidebar-button"][aria-expanded="false"][aria-controls]')].filter(shown);
+    const toggles = [...document.querySelectorAll('button[data-testid="open-sidebar-button"][aria-expanded="false"][aria-controls], button[aria-controls="app-shell-sidebar"][aria-expanded="false"]')].filter(shown);
     if (toggles.length !== 1 || toggles[0].disabled) return null;
     const toggle = toggles[0], sidebarId = toggle.getAttribute('aria-controls');
     return new Promise(resolve => {
@@ -2430,6 +2624,13 @@ var CLF_DOM = (() => {
     });
   }
   return {
+    // Renderer identity and the shared anchors content.js's own observers need. These are
+    // the only provider selectors that leave this file; nothing else may spell one.
+    shell,
+    TURN_SELECTOR: TURN,
+    AUTHORED_SELECTOR: `[data-message-author-role="assistant"], .markdown, ${SHELL_ASSISTANT_UNIT}, ${SHELL_PROSE}`,
+    turnIdOf,
+    messageIdOf,
     userPromptText,
     userMessageReaction,
     presentUserPrompts,

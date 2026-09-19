@@ -15,7 +15,10 @@
   let latest = null;
   let requestOrder = 0, latestOrder = 0;
   const CONVERSATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const REQUEST = /^wfr_[a-zA-Z0-9_-]{1,96}$/;
+  // The workflow id ChatGPT stamps on a connector request and repeats as the MCP request's
+  // x-request-id. Two spellings are live: the classic `wfr_<id>` and, on the 2026-09 Codex
+  // shell cohort, a bare UUID (measured against the app's own ingress log the same minute).
+  const REQUEST = /^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
   const CONVERSATION_FIELD = /(?:^|[,{\s])\"conversation_id\"\s*:\s*\"([0-9a-f-]{36})\"/gi;
   // Passive evidence only: no polling, and no full response survives a scan. Retain a
   // small replay window for document_start -> content-script readiness and deduplicate
@@ -108,8 +111,12 @@
           .map(line => line.slice(5).trimStart()).join('\n');
         event = JSON.parse(data);
       } catch { return; }
-      if (event?.conversation_id !== conversationId) return;
-      const requestIds = new Set([event.metadata?.request_id, event.message?.metadata?.request_id]
+      // A delta-encoded stream carries its first complete message as `{p:'', o:'add', v:{message,
+      // conversation_id}}`; the envelope is not the event, its value is.
+      const body = event && event.o === 'add' && (event.p === '' || event.p === undefined) &&
+        event.v && typeof event.v === 'object' && !Array.isArray(event.v) ? event.v : event;
+      if (body?.conversation_id !== conversationId) return;
+      const requestIds = new Set([body.metadata?.request_id, body.message?.metadata?.request_id]
         .filter(id => typeof id === 'string' && REQUEST.test(id)));
       return requestIds.size ? { conversationId, requestIds: [...requestIds] } : null;
   }
@@ -163,7 +170,7 @@
   function inspectSocketMessage(event) {
     // Pro hands its HTTP stream to the native conversation-turn-stream socket.
     // Observe only complete server envelopes; never subscribe, send or join deltas.
-    if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024 || !event.data.includes('wfr_')) return;
+    if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024 || !event.data.includes('request_id')) return;
     let rows;
     try { rows = JSON.parse(event.data); } catch { return; }
     if (!Array.isArray(rows) || rows.length > 32) return;

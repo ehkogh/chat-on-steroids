@@ -70,10 +70,20 @@
   const MAX_CALLS = 200;
   /** Public generated-image descriptors retained per turn. Pixels never cross this boundary. */
   const MAX_GENERATED_IMAGES = 200;
-  /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  /**
+   * ChatGPT's own turn sections, which is where a turn's message model hangs.
+   *
+   * Two renderers since 2026-09-18 (see chatgpt-dom.js): the classic page's per-message
+   * sections, and the Codex app shell's `[data-turn-key]` exchange, whose React row carries
+   * an `entry.turn` with typed items instead of the classic `messages[]` model. The shell
+   * shape is translated into that classic model once, in shellMessagesOf, so every reader
+   * below keeps working on one vocabulary.
+   */
+  const TURN_SECTION = 'section[data-testid^="conversation-turn"], [data-turn-key]';
+  const SHELL_TURN = '[data-turn-key]';
+  const SHELL_ASSISTANT_UNIT = '[data-content-search-unit-key$=":assistant"]';
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
-  const MARKDOWN = '.markdown';
+  const MARKDOWN = `.markdown, ${SHELL_ASSISTANT_UNIT} [data-markdown-text-style="assistant-message"]`;
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
@@ -245,7 +255,9 @@
         conversations.get(conversation), turn && turn.clientThreadId, turn && turn.conversationId];
       for (let index = 0; index < values.length; index++) {
         const value = str(values[index]);
-        if (!value || value.startsWith('WEB:')) continue;
+        // Local, pre-server identities: the classic `WEB:` thread and the shell's
+        // `local-chatgpt:<uuid>` route it uses until the server assigns the real id.
+        if (!value || value.startsWith('WEB:') || value.startsWith('local-chatgpt:')) continue;
         if (found && found !== value) return { conversationId: null, conflict: true };
         found = value;
       }
@@ -276,7 +288,15 @@
         preamble = candidates.find(candidate => item.key === `preamble-${candidate.id}`)?.id;
         if (!preamble) return null;
       }
-      for (const id of [direct, scoped, preamble]) {
+      // The shell's answer slot carries its typed item, whose messageId is the exact
+      // provider UUID of the final message rendered there.
+      let typed = null;
+      if (item?.type === 'assistant-message') {
+        if (!scope.conversationId || scope.conversationId !== conversationId) return null;
+        typed = str(item.messageId);
+        if (!typed) return null;
+      }
+      for (const id of [direct, scoped, preamble, typed]) {
         if (!id) continue;
         if (!candidates.some(candidate => candidate.id === id)) return null;
         if (found && found !== id) return null;
@@ -1380,6 +1400,275 @@
     return kept;
   }
 
+  // ------------------------------------------------------------------ Codex app shell
+
+  /** The user slot of a shell exchange section, or null for a classic section. */
+  function shellUserSlotOf(section) {
+    try {
+      return section && section.matches && section.matches(SHELL_TURN) ? section.querySelector('[data-content-search-unit-key$=":user"]') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The shell's row entry for a turn section: `{ id, turn, conversationId, … }`.
+   *
+   * It hangs a few Fibers above the `[data-turn-key]` element, on the virtualised row that
+   * renders the whole exchange. A classic section has none, which is how the two renderers
+   * are told apart here without consulting the DOM a second time.
+   */
+  function shellEntryOf(fiber) {
+    let at = fiber;
+    for (let up = 0; at && up < 16; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const entry = props.entry;
+      if (entry && typeof entry === 'object' && entry.turn && typeof entry.turn === 'object' && Array.isArray(entry.turn.items)) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * The shell's React Query client, found once and kept.
+   *
+   * The shell fetches an opened conversation through React Query and leaves the backend
+   * payload in that cache: the classic message model, `mapping` and all, with the request
+   * ids, timestamps and result metadata that the typed turn items no longer carry. The
+   * provider sits high in the tree above every shell surface; the climb is bounded and the
+   * client remembered, re-found only if the mounted tree stops answering for it.
+   */
+  let shellClient = null;
+  function shellQueryClient() {
+    if (shellClient) {
+      try {
+        if (typeof shellClient.getQueryCache === 'function') return shellClient;
+      } catch {
+        // A revoked or replaced client is re-found below.
+      }
+      shellClient = null;
+    }
+    let anchors;
+    try {
+      anchors = document.querySelectorAll(`${SHELL_TURN}, form[data-chatgpt-composer], #app-shell-sidebar`);
+    } catch {
+      return null;
+    }
+    for (let index = 0; index < anchors.length && index < 8; index++) {
+      let at = fiberOf(anchors[index]);
+      for (let up = 0; at && up < 400; up++, at = at.return) {
+        const props = at.memoizedProps;
+        const client = props && typeof props === 'object' ? props.client : null;
+        if (client && typeof client === 'object' && typeof client.getQueryCache === 'function') {
+          shellClient = client;
+          return client;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The server conversation id the shell has recorded for one of its local identities.
+   *
+   * A chat started in this document keeps its `local-chatgpt:<uuid>` identity on the thread
+   * for the document's whole life, and the route alone is never ownership evidence. The
+   * shell does write the pair down: its conversation-details query is keyed by
+   * `{clientConversationId, serverConversationId}` once the server has named the chat. That
+   * is the page's own statement about itself. Two different server ids for one local id
+   * would be a page contradicting itself, and nothing is returned then.
+   */
+  function shellServerConversationOf(localId) {
+    const client = shellQueryClient();
+    if (!client) return null;
+    let found = null;
+    try {
+      for (const query of client.getQueryCache().getAll()) {
+        const key = query && query.queryKey;
+        if (!Array.isArray(key)) continue;
+        for (let at = 0; at < key.length; at++) {
+          const part = key[at];
+          if (!part || typeof part !== 'object') continue;
+          if (part.clientConversationId !== localId && part.conversationId !== localId) continue;
+          const server = str(part.serverConversationId);
+          if (!server || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(server)) continue;
+          if (found && found !== server) return null;
+          found = server;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return found;
+  }
+
+  /** The backend payload's message nodes by id for this exact conversation, or null. */
+  function shellMappingOf(conversationId) {
+    if (!conversationId) return null;
+    const client = shellQueryClient();
+    if (!client) return null;
+    try {
+      const cache = client.getQueryCache();
+      let query = null;
+      for (const candidate of cache.getAll()) {
+        const key = candidate && candidate.queryKey;
+        if (Array.isArray(key) && key.length === 2 && key[0] === 'chatgpt-conversation' && key[1] === conversationId) {
+          query = candidate;
+          break;
+        }
+      }
+      const mapping = query && query.state && query.state.data && query.state.data.mapping;
+      return mapping && typeof mapping === 'object' ? mapping : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The classic message model of one shell turn.
+   *
+   * Preferred source: the backend payload in the query cache, read by the turn's own message
+   * ids. That is the exact model the readers below were written for — request ids,
+   * creation times, results, thought objects — and it exists for every conversation the
+   * page loaded. It does not exist for a conversation started in this document, whose turns
+   * are only the typed items, so those are translated: a user item to a user text message;
+   * a preamble to a commentary message; a tool call to an `api_tool` request naming only its
+   * path, plus a result stub once the page marks the call completed; the answer to a `final`
+   * message whose end_turn is its completion. Rehydrated calls always report incomplete, so
+   * a turn the page no longer runs counts every call as answered — the app's own tool truth
+   * decides what a call actually did. Ids the page does not give (commentary, thoughts) are
+   * minted from the turn id and position: stable across scans, never mistakable for a
+   * provider UUID, and marked unstable by the readers since they carry no creation time.
+   */
+  /**
+   * The exchange's messages out of the backend payload, in tree order, or null.
+   *
+   * The turn's `messageIds` name what the page shows — the prompt, thoughts, requests and
+   * the answer — and not the tool results, which are what say whether a request was
+   * answered. The payload is a tree, so the exchange is walked from its prompt along the
+   * child links: where a node branches (a regenerate), the child the page shows wins;
+   * otherwise the newest. The walk stops at the next prompt. Every id the page shows must
+   * lie on the walked path, or the path is some other branch and nothing is returned.
+   */
+  function shellMappingMessages(mapping, ids) {
+    const wanted = new Set(ids);
+    const own = (id) => Object.prototype.hasOwnProperty.call(mapping, id) ? mapping[id] : null;
+    let node = own(ids[0]);
+    if (!node || typeof node !== 'object') return null;
+    const out = [];
+    const seen = new Set();
+    while (node && typeof node === 'object' && out.length < MAX_ROWS) {
+      const id = str(node.id);
+      if (!id || seen.has(id)) break;
+      seen.add(id);
+      const message = node.message;
+      if (message && typeof message === 'object') {
+        const content = message.content && typeof message.content === 'object' ? message.content : null;
+        const prompt = message.author && message.author.role === 'user' && content &&
+          (content.content_type === 'text' || content.content_type === 'multimodal_text');
+        if (prompt && out.length > 0) break;
+        out.push(message);
+      }
+      const children = Array.isArray(node.children) ? node.children : [];
+      let next = null;
+      for (let at = 0; at < children.length && !next; at++) if (wanted.has(children[at])) next = children[at];
+      if (!next && children.length > 0) next = children[children.length - 1];
+      node = next ? own(next) : null;
+    }
+    for (let at = 0; at < ids.length; at++) if (!seen.has(ids[at])) return null;
+    return out;
+  }
+
+  function shellMessagesOf(entry, conversationId) {
+    const turn = entry.turn;
+    const ids = Array.isArray(turn.messageIds) ? turn.messageIds.filter(id => typeof id === 'string') : [];
+    const mapping = shellMappingOf(conversationId);
+    if (mapping && ids.length > 0 && ids.length <= MAX_ROWS) {
+      const found = shellMappingMessages(mapping, ids);
+      if (found) return found;
+    }
+    const turnId = str(entry.id) || 'turn';
+    const settled = turn.status !== 'in_progress';
+    const out = [];
+    let ordinal = 0;
+    for (let at = 0; at < turn.items.length && out.length < MAX_ROWS; at++) {
+      const item = turn.items[at];
+      if (!item || typeof item !== 'object') continue;
+      if (item.type === 'user-message') {
+        const id = str(item.messageId) || str(item.serverMessageId);
+        if (!id) continue;
+        out.push({ id, author: { role: 'user' }, content: { content_type: 'text', parts: [typeof item.message === 'string' ? item.message : ''] }, metadata: {}, create_time: null });
+      } else if (item.type === 'chatgpt-reasoning-group' && Array.isArray(item.items)) {
+        for (let stepAt = 0; stepAt < item.items.length && out.length < MAX_ROWS; stepAt++) {
+          const step = item.items[stepAt];
+          if (!step || typeof step !== 'object') continue;
+          const index = ordinal++;
+          if (step.type === 'reasoning') {
+            const content = typeof step.content === 'string' ? step.content : '';
+            if (step.presentation === 'thought') {
+              out.push({ id: `${turnId}:thought:${index}`, author: { role: 'assistant' }, content: { content_type: 'thoughts', thoughts: [{ summary: content, content }] }, metadata: {} });
+            } else if (content) {
+              out.push({ id: `${turnId}:commentary:${index}`, author: { role: 'assistant' }, channel: 'commentary', content: { content_type: 'text', parts: [content] },
+                status: step.completed === true || settled ? 'finished_successfully' : 'in_progress', end_turn: false, metadata: {}, create_time: null });
+            }
+          } else if (step.type === 'mcp-tool-call') {
+            const id = str(step.callId);
+            const invocation = step.invocation && typeof step.invocation === 'object' ? step.invocation : null;
+            const server = invocation ? str(invocation.server) : null;
+            const tool = invocation ? str(invocation.tool) : null;
+            if (!id || !server || !tool || server.indexOf('/') >= 0) continue;
+            const path = `/${server}/${tool}`;
+            // Only the path, spelled the way the classic payload opens, so requestOf reads
+            // it off the front exactly as it does there. Nothing of the arguments is copied.
+            if (path.indexOf('"') >= 0 || path.indexOf('\\') >= 0 || path.length > 200) continue;
+            out.push({ id, author: { role: 'assistant' }, recipient: 'api_tool.call_tool', content: { content_type: 'code', text: `{"path":"${path}"}` }, metadata: {}, create_time: null });
+            if (step.completed === true || settled) {
+              out.push({ id: `${id}:result`, author: { role: 'tool', name: 'api_tool.call_tool' }, recipient: 'all', content: { content_type: 'code', text: '' },
+                metadata: { parent_id: id, invoked_resource: { app_name: server, resource_uri: path } } });
+            }
+          }
+        }
+      } else if (item.type === 'assistant-message') {
+        const id = str(item.messageId);
+        if (!id) continue;
+        const completed = item.completed === true;
+        out.push({ id, author: { role: 'assistant' }, channel: !item.phase || item.phase === 'final_answer' ? 'final' : 'commentary',
+          content: { content_type: 'text', parts: [typeof item.content === 'string' ? item.content : ''] },
+          status: completed ? 'finished_successfully' : 'in_progress', end_turn: completed, metadata: {}, create_time: null });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The shell's native activity: one caption per thought object in the turn model.
+   *
+   * The classic reader keys captions on the DOM rows the page draws for them, and the shell
+   * draws no per-thought row this file can identify. The thought objects are the identity
+   * and the caption at once, so they are reported directly, in model order, with no DOM
+   * row to stamp for suppression.
+   */
+  function shellActivitiesOf(messages) {
+    const events = [];
+    const notifications = [];
+    for (let at = 0; at < messages.length && notifications.length < MAX_CALLS; at++) {
+      const message = messages[at];
+      if (!thoughtMessage(message)) continue;
+      const id = str(message.id);
+      const thoughts = Array.isArray(message.content.thoughts) ? message.content.thoughts : [];
+      let label = '';
+      for (let thoughtAt = 0; thoughtAt < thoughts.length; thoughtAt++) {
+        const thought = thoughts[thoughtAt];
+        const summary = thought && typeof thought === 'object' ? str(thought.summary) || str(thought.content) : null;
+        if (summary) label = label ? `${label}\n${summary}` : summary;
+      }
+      label = visibleText(label).slice(0, 300);
+      notifications.push({ messageId: id, kind: 'thought_notification' });
+      if (label) events.push({ messageId: id, label, order: at });
+    }
+    return { events, notifications };
+  }
+
   /**
    * The per-turn call evidence for the assistant turns currently on screen.
    *
@@ -1407,7 +1696,11 @@
     const groups = [];
     for (let at = 0; at < sections.length; at++) {
       const section = sections[at];
-      const id = str(section.getAttribute('data-turn-id'));
+      // The shell's turn id is on the search-key wrapper inside the exchange; the exchange's
+      // own key is the user message id, kept only as a fallback identity.
+      const keyed = section.matches(SHELL_TURN) ? section.querySelector('[data-content-search-turn-key]') : null;
+      const id = keyed ? str(keyed.getAttribute('data-content-search-turn-key')) || str(section.getAttribute('data-turn-key'))
+        : str(section.getAttribute('data-turn-id'));
       const previous = groups[groups.length - 1];
       if (id && previous && previous.turnId === id) previous.sections.push(section);
       else groups.push({ turnId: id, sections: [section] });
@@ -1441,15 +1734,27 @@
       try {
         const fiber = fiberOf(section);
         if (!fiber) continue;
-        const messages = turnMessagesOf(fiber);
+        const shellEntry = shellEntryOf(fiber);
+        // The shell names the conversation on its entry; the classic climb still runs so a
+        // branch mounted from another chat is caught as a conflict the same way.
+        const conversation = conversationEvidenceOf(fiber);
+        if (shellEntry && !conversation.conflict && !conversation.conversationId) {
+          const named = str(shellEntry.conversationId);
+          if (named && !named.startsWith('local-chatgpt:')) conversation.conversationId = named;
+          else if (named) conversation.conversationId = shellServerConversationOf(named);
+        }
+        const messages = shellEntry ? shellMessagesOf(shellEntry, conversation.conversationId) : turnMessagesOf(fiber);
         const codeReceipts = codeModeReceipts(messages || []);
         const codeModeCalls = (messages || []).filter(message => message && message.author &&
           message.author.role === 'assistant' && message.recipient === 'functions.exec').slice(0, MAX_CALLS)
           .map(message => ({ messageId: str(message.id), requestId: str(message.metadata && message.metadata.request_id),
             answered: codeReceipts.get(message.id) === true }));
         const calls = callsOf(messages, codeReceipts);
+        // The shell says whether the turn is still running. A request in a turn it has
+        // finished cannot still be awaiting its result, even where the payload's chain
+        // pairs that result with a neighbouring node rather than the request itself.
+        if (shellEntry && shellEntry.turn.status !== 'in_progress') for (let at = 0; at < calls.length; at++) calls[at].answered = true;
         const requests = requestIdsOf(messages);
-        const conversation = conversationEvidenceOf(fiber);
         const exactAnchors = new Map();
         const exactThoughtRows = new Map();
         const exactImageNodes = new Map();
@@ -1457,7 +1762,7 @@
         const before = turnBudget.remaining;
         const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget, exactAnchors, conversation.conversationId);
         responseBudget.remaining -= before - turnBudget.remaining;
-        const nativeActivities = nativeActivitiesOf(group.sections, messages, exactThoughtRows);
+        const nativeActivities = shellEntry ? shellActivitiesOf(messages || []) : nativeActivitiesOf(group.sections, messages, exactThoughtRows);
         const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes);
         const activities = nativeActivities.events;
         const endMessageId = turnEndMessageId(messages);
@@ -1487,7 +1792,12 @@
         // it after the scan, so a stable scan produces no attribute mutation at all.
         for (let sectionAt = 0; sectionAt < group.sections.length; sectionAt++) {
           const stamped = group.sections[sectionAt];
-          if (stamped) desiredTurnStamps.set(stamped, `${scanToken}:${index}`);
+          if (!stamped) continue;
+          desiredTurnStamps.set(stamped, `${scanToken}:${index}`);
+          // A shell exchange is also read as a separate user turn whose node is the user
+          // slot inside it; that slot carries the same descriptor.
+          const slot = shellUserSlotOf(stamped);
+          if (slot) desiredTurnStamps.set(slot, `${scanToken}:${index}`);
         }
         if (!conversation.conflict) for (const [node, id] of exactAnchors) {
           desiredMessageStamps.set(node, `${scanToken}:${index}:${encodeURIComponent(id)}`);
@@ -1514,7 +1824,7 @@
       const section = sections[at];
       try {
         if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll('[data-clf-fiber-message], .markdown')) {
+        for (const node of section.querySelectorAll(`[data-clf-fiber-message], ${MARKDOWN}`)) {
           const wantedMessage = desiredMessageStamps.get(node);
           const currentMessage = node.getAttribute('data-clf-fiber-message');
           if (wantedMessage === undefined) {
@@ -1535,12 +1845,15 @@
             if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
           } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
         }
-        const wanted = desiredTurnStamps.get(section);
-        const current = section.getAttribute('data-clf-fiber-turn');
-        if (wanted === undefined) {
-          if (current !== null && section.removeAttribute) section.removeAttribute('data-clf-fiber-turn');
-        } else if (current !== wanted && section.setAttribute) {
-          section.setAttribute('data-clf-fiber-turn', wanted);
+        const slot = shellUserSlotOf(section);
+        for (const stamped of slot ? [section, slot] : [section]) {
+          const wanted = desiredTurnStamps.get(stamped);
+          const current = stamped.getAttribute('data-clf-fiber-turn');
+          if (wanted === undefined) {
+            if (current !== null && stamped.removeAttribute) stamped.removeAttribute('data-clf-fiber-turn');
+          } else if (current !== wanted && stamped.setAttribute) {
+            stamped.setAttribute('data-clf-fiber-turn', wanted);
+          }
         }
       } catch {
         // One hostile/stale DOM node must not cost the remaining turns their evidence.
@@ -1611,13 +1924,13 @@
   function pickerSnapshot() {
     // The closed native trigger retains the same picker owner. Passive recording
     // must not depend on discovery opening its portal first.
-    const form = document.querySelector('#prompt-textarea')?.closest('form');
+    const form = document.querySelector('#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]')?.closest('form');
     const triggers = [...(form?.querySelectorAll('button[aria-haspopup="menu"]') || [])]
       .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 &&
         node.id !== 'composer-plus-btn' && node.getAttribute('data-testid') !== 'composer-plus-btn');
-    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]') || (triggers.length === 1 ? triggers[0] : null);
+    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"], [data-model-picker-view]') || (triggers.length === 1 ? triggers[0] : null);
     let state = null;
-    try { state = readPickerSnapshot(node); } catch { /* Unknown state invalidates prior proof. */ }
+    try { state = readPickerSnapshot(node) || readShellPickerSnapshot(triggers.length === 1 ? triggers[0] : node); } catch { /* Unknown state invalidates prior proof. */ }
     const selected = state?.choices.find(choice => choice.bucket === state.currentBucket && choice.available) ||
       (triggers.length === 1 && node === triggers[0] ? closedPickerSelection(node) : null);
     for (const [attribute, value] of [['data-clf-selected-model', selected?.id], ['data-clf-selected-effort', selected?.effort], ['data-clf-selected-route', selected && location.pathname]]) {
@@ -1677,6 +1990,67 @@
       const selected = state.currentSelection;
       const chosen = choices.find(c => c.bucket === currentBucket);
       if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
+      return { version, currentBucket, versions, choices };
+    }
+    return null;
+  }
+
+  /**
+   * The shell's picker state, read from its owner component above the composer trigger.
+   *
+   * `powerSelections` are the effort buckets of the selected version, `modelListConfig
+   * .options` the versions, `selectedPowerSelection` the current bucket. The owner is
+   * mounted whether the menu is open or closed, so passive observation needs no portal,
+   * and the open menu itself sits too deep in Radix wrappers to reach it — read from the
+   * trigger. The shape is mapped onto the classic snapshot so the isolated reader keeps one
+   * contract: bucket = powerSettingIndex, id = execution model slug, effort = the shell's
+   * own normalised effort, family = the selected version entry. Like the classic reader
+   * this describes only the selected version's buckets, never a complete catalog.
+   */
+  function readShellPickerSnapshot(node) {
+    let fiber = node && fiberOf(node);
+    for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (!props || typeof props !== 'object' || !Array.isArray(props.powerSelections)) continue;
+      // An explicit choice is `selectedPowerSelection`; a composer left on the account's
+      // default has none and shows `selectedLabelCandidate`, the same shape resolved by the
+      // page itself (a fresh home composer sends exactly that model). Either names the
+      // current bucket by execution model and effort, never by position.
+      const selected = props.selectedPowerSelection && typeof props.selectedPowerSelection === 'object' ? props.selectedPowerSelection
+        : props.selectedLabelCandidate && typeof props.selectedLabelCandidate === 'object' ? props.selectedLabelCandidate : null;
+      const list = props.modelListConfig;
+      const options = list && typeof list === 'object' && Array.isArray(list.options) ? list.options : null;
+      if (!selected || !options || props.powerSelections.length > 12 || options.length > 20) return null;
+      const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
+      const groupId = value => typeof value === 'string' && /^[a-zA-Z0-9._ -]{1,80}$/.test(value) && value.trim() === value && value.trim() ? value : null;
+      const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
+      const effortOf = value => ({ none: 'none', instant: 'none', minimal: 'minimal', min: 'low', low: 'low', standard: 'medium', medium: 'medium',
+        extended: 'high', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro' })[String(value || '').toLowerCase()] || null;
+      const versions = options.filter(option => option && typeof option === 'object' && option.disabled !== true)
+        .map(option => ({ id: groupId(option.id), label: label(option.label) }));
+      const current = options.find(option => option && typeof option === 'object' && option.selected === true);
+      const version = current ? groupId(current.id) : null;
+      const familyLabel = current ? label(current.label) : null;
+      const choices = props.powerSelections.map(choice => {
+        const name = choice && typeof choice === 'object' ? label(choice.modelLabel) : null;
+        return {
+          bucket: choice && typeof choice === 'object' && Number.isInteger(choice.powerSettingIndex) ? choice.powerSettingIndex : NaN,
+          id: choice && typeof choice === 'object' ? id(choice.model) : null,
+          label: name ? (/^\d/.test(name) ? `GPT-${name}` : name) : familyLabel,
+          effort: choice && typeof choice === 'object' ? effortOf(choice.reasoningEffort) : null,
+          familyId: version,
+          familyLabel,
+          available: props.modelSelectionDisabled !== true
+        };
+      });
+      if (!version || !familyLabel || !versions.length || versions.some(v => !v.id || !v.label) ||
+          choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.effort) ||
+          new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length ||
+          !versions.some(v => v.id === version)) return null;
+      const matching = choices.filter(c => c.id === id(selected.model) && c.effort === effortOf(selected.reasoningEffort));
+      if (matching.length !== 1) return null;
+      const currentBucket = matching[0].bucket;
+      if (Number.isInteger(selected.powerSettingIndex) && selected.powerSettingIndex !== currentBucket) return null;
       return { version, currentBucket, versions, choices };
     }
     return null;

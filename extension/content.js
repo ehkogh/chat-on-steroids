@@ -728,8 +728,15 @@
     const temporary = desktopDecision?.temporary && desktopDecision.onTarget() &&
       (!desktopDecision.messageId || desktopDecision.messageId === message.id);
     if (turn && (turn.conversationConflict || (!temporary && turn.conversationId !== CLF_DOM.conversationId()))) return null;
-    const authored = (turn?.messages || []).filter(candidate => candidate.role === 'user' && candidate.stable === true &&
+    const byId = (turn?.messages || []).filter(candidate => candidate.role === 'user' && candidate.stable === true &&
       (candidate.rawMessageId === message.id || candidate.messageId === message.id));
+    // The shell names a rendered user message by its slot in the exchange, and the page
+    // model names it by UUID; the exchange holds one user slot and its turn model one user
+    // message, so the shared page turn id is the join there. Nothing else may stand in for
+    // an id: two user candidates in one turn stay ambiguous.
+    const byTurn = !byId.length && CLF_DOM.shell() && message.turnId && turn?.turnId === message.turnId
+      ? (turn.messages || []).filter(candidate => candidate.role === 'user' && candidate.stable === true) : [];
+    const authored = byId.length ? byId : byTurn;
     if (authored.length > 1) return null;
     // A current exact-id provider object supersedes display text. If absent, an unchanged
     // plain-text bubble retains the existing exact-text receipt contract; no Markdown stripping.
@@ -2691,8 +2698,7 @@
     void flush();
   }
 
-  const turnIdOf = (section) =>
-    section && section.getAttribute ? section.getAttribute('data-turn-id') : null;
+  const turnIdOf = (section) => CLF_DOM.turnIdOf(section);
 
   /**
    * Watches for connector rows as ChatGPT inserts them, rather than waiting for a tick.
@@ -2807,7 +2813,7 @@
         return false;
       });
       if (!relevant) return;
-      const authoredSelector = '[data-message-author-role="assistant"], .markdown';
+      const authoredSelector = CLF_DOM.AUTHORED_SELECTOR;
       const nativeAuthoredNode = (node) => {
         const element = node && node.nodeType === 1 ? node : node?.parentElement;
         return Boolean(element && !ownStreamNode(element) &&
@@ -2880,7 +2886,7 @@
     });
   }
 
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  const TURN_SECTION = CLF_DOM.TURN_SELECTOR;
   let seededPath = null;
 
   /**
@@ -7880,7 +7886,7 @@
     const current = bootstrap && bootstrapOwner?.conversationId === conversationId &&
       bootstrapOwner.epoch === epoch && CLF_DOM.conversationId() === conversationId;
     const message = current && node ? CLF_DOM.messages().find(message => message.role === 'user' &&
-      message.id === node.getAttribute('data-message-id')) : null;
+      message.id === CLF_DOM.messageIdOf(node)) : null;
     const source = message && bootstrapOwner.messageId === message.id
       ? userMessageSource(message) : null;
     const identity = source ? `${conversationId}:${epoch}:${message.id}:${bootstrap}` : null;
@@ -10664,7 +10670,8 @@
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed)) return;
     const raw = Array.isArray(event.data.requestIds) ? event.data.requestIds : [];
     if (raw.length === 0 || raw.length > 16) return;
-    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && /^wfr_[a-zA-Z0-9_-]{1,96}$/.test(id)))];
+    // Both live spellings of the workflow id: classic `wfr_<id>` and the shell cohort's bare UUID.
+    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && /^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(id)))];
     if (requestIds.length === 0) return;
     const observedAt = Number.isFinite(event.data.observedAt) ? event.data.observedAt : Date.now();
     confirmStreamRequestOrigin(claimed, requestIds, observedAt);
